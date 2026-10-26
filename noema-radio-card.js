@@ -3,7 +3,7 @@
  * Обложки (плеер → iTunes → MusicBrainz/Cover Art Archive), исполнитель,
  * выбор плеера, список станций с визуальным редактором.
  */
-const NRC_VERSION = '1.5.0';
+const NRC_VERSION = '1.6.0';
 
 const NRC_DEFAULT_STATIONS = [
   { name: 'Morow', url: 'http://stream.fr.morow.com:8080/morow_med.mp3' },
@@ -362,7 +362,7 @@ class NoemaRadioCard extends HTMLElement {
     push(config.entity);
 
     this._config = {
-      columns: 2, glass: true, all_players: true, multiroom: true, cover_lookup: true, laut_meta: true, player_art: true,
+      columns: 2, glass: true, all_players: true, multiroom: true, group: true, cover_lookup: true, laut_meta: true, player_art: true,
       show_volume: true, media_content_type: 'music', ...config,
     };
     let btns = Array.isArray(config.buttons) ? config.buttons.filter((b) => NRC_BUTTONS.includes(b)) : [...NRC_BUTTONS];
@@ -572,17 +572,26 @@ class NoemaRadioCard extends HTMLElement {
           return;
         }
         const cur = this._selectedPlayers();
-        if (cur.includes(id)) {
-          if (cur.length < 2) return;
-          this._setPlayers(cur.filter((x) => x !== id));
-        } else {
-          this._setPlayers([...cur, id]);
-          // подключаем новую колонку к тому, что уже играет
-          const s0 = this._stateObj();
-          const i0 = s0 && (s0.state === 'playing' || s0.state === 'buffering') ? this._currentIndex(s0) : -1;
-          if (i0 >= 0 && this._hass) {
-            nrcLS.set(`${this._storeKey}:station:${id}`, this._stations[i0].url);
-            this._hass.callService('media_player', 'play_media', { entity_id: id, media_content_id: this._stations[i0].url, media_content_type: this._config.media_content_type || 'music' });
+        if (cur.includes(id) && cur.length < 2) return;
+        const next = cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id];
+        const s0 = this._stateObj();
+        const i0 = s0 && (s0.state === 'playing' || s0.state === 'buffering') ? this._currentIndex(s0) : -1;
+        const url = i0 >= 0 ? this._stations[i0].url : null;
+        const play = (pid) => {
+          nrcLS.set(`${this._storeKey}:station:${pid}`, url);
+          this._hass.callService('media_player', 'play_media', { entity_id: pid, media_content_id: url, media_content_type: this._config.media_content_type || 'music' });
+        };
+        this._setPlayers(next);
+        if (this._hass) {
+          // убранные колонки выходят из группы
+          cur.filter((x) => !next.includes(x) && this._groupable(x))
+            .forEach((x) => this._hass.callService('media_player', 'unjoin', { entity_id: x }));
+          if (this._grouped(next)) {
+            // нативная группа: играет лидер, остальные присоединяются и синхронизируются
+            if (url && next[0] !== cur[0]) play(next[0]);
+            this._hass.callService('media_player', 'join', { entity_id: next[0], group_members: next.slice(1) });
+          } else if (url && !cur.includes(id)) {
+            play(id);
           }
         }
         this._coverKey = null;
@@ -614,8 +623,20 @@ class NoemaRadioCard extends HTMLElement {
     return pid && this._hass ? this._hass.states[pid] : null;
   }
 
+  _groupable(id) {
+    const so = this._hass && this._hass.states[id];
+    return !!so && !!((so.attributes.supported_features || 0) & 524288);
+  }
+
+  // все выбранные колонки умеют нативную группировку (Music Assistant, Sonos, Cast…)
+  _grouped(pids) {
+    return this._config.group !== false && pids.length > 1 && pids.every((x) => this._groupable(x));
+  }
+
   _call(service, data = {}, pids = this._selectedPlayers()) {
     if (!pids.length || !this._hass) return undefined;
+    // в группе транспорт идёт только лидеру, громкость и mute — каждой колонке
+    if (this._grouped(pids) && ['play_media', 'media_play', 'media_pause', 'media_stop'].includes(service)) pids = [pids[0]];
     return this._hass.callService('media_player', service, { entity_id: pids.length === 1 ? pids[0] : pids, ...data });
   }
 
@@ -916,6 +937,7 @@ const NRC_LABELS = {
   entities: 'Избранные плееры (первый — по умолчанию)',
   all_players: 'Выбор любого плеера в карточке',
   multiroom: 'Мультирум: несколько колонок сразу',
+  group: 'Нативная группа (Music Assistant, Sonos…) для синхронного звука',
   columns: 'Колонок в списке станций',
   glass: 'Стеклянный фон',
   cover_lookup: 'Искать обложки в интернете',
@@ -977,6 +999,7 @@ class NoemaRadioCardEditor extends HTMLElement {
         type: 'grid', name: '', schema: [
           { name: 'all_players', selector: { boolean: {} } },
           { name: 'multiroom', selector: { boolean: {} } },
+          { name: 'group', selector: { boolean: {} } },
           { name: 'glass', selector: { boolean: {} } },
           { name: 'cover_lookup', selector: { boolean: {} } },
           { name: 'player_art', selector: { boolean: {} } },
@@ -1022,6 +1045,7 @@ class NoemaRadioCardEditor extends HTMLElement {
       columns: c.columns || 2,
       all_players: c.all_players !== false,
       multiroom: c.multiroom !== false,
+      group: c.group !== false,
       glass: c.glass !== false,
       buttons: Array.isArray(c.buttons) ? c.buttons : NRC_BUTTONS.filter((b) => !(b === 'volume' && c.show_volume === false)),
       cover_lookup: c.cover_lookup !== false,
