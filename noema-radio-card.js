@@ -3,7 +3,7 @@
  * Обложки (плеер → iTunes → MusicBrainz/Cover Art Archive), исполнитель,
  * выбор плеера, список станций с визуальным редактором.
  */
-const NRC_VERSION = '1.4.0';
+const NRC_VERSION = '1.5.0';
 
 const NRC_DEFAULT_STATIONS = [
   { name: 'Morow', url: 'http://stream.fr.morow.com:8080/morow_med.mp3' },
@@ -362,7 +362,7 @@ class NoemaRadioCard extends HTMLElement {
     push(config.entity);
 
     this._config = {
-      columns: 2, glass: true, all_players: true, cover_lookup: true, laut_meta: true, player_art: true,
+      columns: 2, glass: true, all_players: true, multiroom: true, cover_lookup: true, laut_meta: true, player_art: true,
       show_volume: true, media_content_type: 'music', ...config,
     };
     let btns = Array.isArray(config.buttons) ? config.buttons.filter((b) => NRC_BUTTONS.includes(b)) : [...NRC_BUTTONS];
@@ -517,11 +517,21 @@ class NoemaRadioCard extends HTMLElement {
     return this._config.all_players !== false && id.startsWith('media_player.') && !!(this._hass && this._hass.states[id]);
   }
 
-  _selectedPlayer() {
-    const saved = nrcLS.get(`${this._storeKey}:player`);
-    if (this._allowed(saved)) return saved;
-    return this._entities.length ? this._entities[0].entity : null;
+  _selectedPlayers() {
+    let saved = [];
+    try { saved = JSON.parse(nrcLS.get(`${this._storeKey}:players`) || '[]'); } catch (e) { /* ignore */ }
+    if (!Array.isArray(saved) || !saved.length) {
+      const old = nrcLS.get(`${this._storeKey}:player`);
+      saved = old ? [old] : [];
+    }
+    let list = saved.filter((id, i) => typeof id === 'string' && saved.indexOf(id) === i && this._allowed(id));
+    if (!list.length && this._entities.length) list = [this._entities[0].entity];
+    return this._config.multiroom === false ? list.slice(0, 1) : list;
   }
+
+  _selectedPlayer() { return this._selectedPlayers()[0] || null; }
+
+  _setPlayers(list) { nrcLS.set(`${this._storeKey}:players`, JSON.stringify(list)); }
 
   _pname(id) {
     const e = this._entities.find((x) => x.entity === id);
@@ -532,7 +542,8 @@ class NoemaRadioCard extends HTMLElement {
   _openMenu() {
     const m = this.$.menu;
     m.innerHTML = '';
-    const cur = this._selectedPlayer();
+    const sel = this._selectedPlayers();
+    const multi = this._config.multiroom !== false;
     const conf = this._entities.map((e) => e.entity);
     const others = this._config.all_players === false || !this._hass ? [] : Object.keys(this._hass.states)
       .filter((id) => id.startsWith('media_player.') && !conf.includes(id))
@@ -544,23 +555,45 @@ class NoemaRadioCard extends HTMLElement {
     const add = (id, icon) => {
       const so = this._hass && this._hass.states[id];
       const b = document.createElement('button');
-      b.className = 'mi' + (id === cur ? ' on' : '') + (!so || so.state === 'unavailable' ? ' na' : '');
+      b.className = 'mi' + (sel.includes(id) ? ' on' : '') + (!so || so.state === 'unavailable' ? ' na' : '');
       b.innerHTML = '<ha-icon class="ic"></ha-icon><span class="mn"></span><span class="ms"></span>';
-      b.querySelector('.ic').setAttribute('icon', id === cur ? 'mdi:check-circle' : icon);
+      b.querySelector('.ic').setAttribute('icon', sel.includes(id) ? 'mdi:check-circle' : (multi ? 'mdi:circle-outline' : icon));
       b.querySelector('.mn').textContent = this._pname(id);
       b.querySelector('.ms').textContent = stateText(so);
       b.title = id;
       b.addEventListener('click', (ev) => {
         ev.stopPropagation();
-        nrcLS.set(`${this._storeKey}:player`, id);
+        if (!multi) {
+          this._setPlayers([id]);
+          this._coverKey = null;
+          this._pending = null;
+          this._closeMenu();
+          this._update();
+          return;
+        }
+        const cur = this._selectedPlayers();
+        if (cur.includes(id)) {
+          if (cur.length < 2) return;
+          this._setPlayers(cur.filter((x) => x !== id));
+        } else {
+          this._setPlayers([...cur, id]);
+          // подключаем новую колонку к тому, что уже играет
+          const s0 = this._stateObj();
+          const i0 = s0 && (s0.state === 'playing' || s0.state === 'buffering') ? this._currentIndex(s0) : -1;
+          if (i0 >= 0 && this._hass) {
+            nrcLS.set(`${this._storeKey}:station:${id}`, this._stations[i0].url);
+            this._hass.callService('media_player', 'play_media', { entity_id: id, media_content_id: this._stations[i0].url, media_content_type: this._config.media_content_type || 'music' });
+          }
+        }
         this._coverKey = null;
         this._pending = null;
-        this._closeMenu();
+        this._openMenu();
         this._update();
       });
       m.appendChild(b);
     };
     const head = (t) => { const h = document.createElement('div'); h.className = 'mh'; h.textContent = t; m.appendChild(h); };
+    if (multi) head('Играть на нескольких колонках');
     if (conf.length && others.length) head('Избранные');
     conf.forEach((id) => add(id, 'mdi:speaker'));
     if (others.length) { if (conf.length) head('Все плееры'); others.forEach((id) => add(id, 'mdi:speaker-wireless')); }
@@ -581,10 +614,9 @@ class NoemaRadioCard extends HTMLElement {
     return pid && this._hass ? this._hass.states[pid] : null;
   }
 
-  _call(service, data = {}) {
-    const pid = this._selectedPlayer();
-    if (!pid || !this._hass) return undefined;
-    return this._hass.callService('media_player', service, { entity_id: pid, ...data });
+  _call(service, data = {}, pids = this._selectedPlayers()) {
+    if (!pids.length || !this._hass) return undefined;
+    return this._hass.callService('media_player', service, { entity_id: pids.length === 1 ? pids[0] : pids, ...data });
   }
 
   _currentIndex(s) {
@@ -601,9 +633,10 @@ class NoemaRadioCard extends HTMLElement {
 
   _playStation(i) {
     const st = this._stations[i];
-    const pid = this._selectedPlayer();
+    const pids = this._selectedPlayers();
+    const pid = pids[0];
     if (!st || !pid) return;
-    nrcLS.set(`${this._storeKey}:station:${pid}`, st.url);
+    pids.forEach((id) => nrcLS.set(`${this._storeKey}:station:${id}`, st.url));
     this._pending = { pid, i, until: Date.now() + 8000 };
     this._coverKey = null;
     this._call('play_media', { media_content_id: st.url, media_content_type: this._config.media_content_type || 'music' });
@@ -617,7 +650,7 @@ class NoemaRadioCard extends HTMLElement {
     this._playStation(i < 0 ? (dir > 0 ? 0 : n - 1) : (i + dir + n) % n);
   }
 
-  _muteKey() { return `${this._storeKey}:mutevol:${this._selectedPlayer()}`; }
+  _muteKey(pid = this._selectedPlayer()) { return `${this._storeKey}:mutevol:${pid}`; }
 
   _isMuted(s) {
     const a = s.attributes;
@@ -628,22 +661,28 @@ class NoemaRadioCard extends HTMLElement {
   _toggleMute() {
     const s = this._stateObj();
     if (!s) return;
-    const a = s.attributes;
-    if ((a.supported_features || 0) & 8) {
-      this._call('volume_mute', { is_volume_muted: !a.is_volume_muted });
-      return;
-    }
-    // плеер не умеет mute — эмулируем через громкость 0 и запоминаем прежнюю
-    if (typeof a.volume_level !== 'number') return;
-    const saved = nrcLS.get(this._muteKey());
-    if (a.volume_level === 0) {
-      const back = saved !== null ? Number(saved) : 0.3;
-      try { localStorage.removeItem(this._muteKey()); } catch (e) { /* ignore */ }
-      this._call('volume_set', { volume_level: back > 0 ? back : 0.3 });
-    } else {
-      nrcLS.set(this._muteKey(), String(a.volume_level));
-      this._call('volume_set', { volume_level: 0 });
-    }
+    const mute = !this._isMuted(s);
+    this._selectedPlayers().forEach((pid) => {
+      const so = this._hass.states[pid];
+      if (!so) return;
+      const a = so.attributes;
+      if ((a.supported_features || 0) & 8) {
+        this._call('volume_mute', { is_volume_muted: mute }, [pid]);
+        return;
+      }
+      // плеер не умеет mute — эмулируем через громкость 0 и запоминаем прежнюю
+      if (typeof a.volume_level !== 'number') return;
+      const key = this._muteKey(pid);
+      const saved = nrcLS.get(key);
+      if (!mute && a.volume_level === 0) {
+        const back = saved !== null ? Number(saved) : 0.3;
+        try { localStorage.removeItem(key); } catch (e) { /* ignore */ }
+        this._call('volume_set', { volume_level: back > 0 ? back : 0.3 }, [pid]);
+      } else if (mute && a.volume_level > 0) {
+        nrcLS.set(key, String(a.volume_level));
+        this._call('volume_set', { volume_level: 0 }, [pid]);
+      }
+    });
   }
 
   _togglePlay() {
@@ -692,7 +731,8 @@ class NoemaRadioCard extends HTMLElement {
     const c = this._config;
     const pid = this._selectedPlayer();
 
-    this._setText(this.$.pname, pid ? this._pname(pid) : 'Выбрать плеер');
+    const nsel = this._selectedPlayers().length;
+    this._setText(this.$.pname, pid ? this._pname(pid) + (nsel > 1 ? ` +${nsel - 1}` : '') : 'Выбрать плеер');
     this.$.pbox.hidden = !pid && !this._entities.length && this._config.all_players === false;
 
     const s = pid ? this._hass.states[pid] : null;
@@ -875,6 +915,7 @@ const NRC_LABELS = {
   name: 'Заголовок (необязательно)',
   entities: 'Избранные плееры (первый — по умолчанию)',
   all_players: 'Выбор любого плеера в карточке',
+  multiroom: 'Мультирум: несколько колонок сразу',
   columns: 'Колонок в списке станций',
   glass: 'Стеклянный фон',
   cover_lookup: 'Искать обложки в интернете',
@@ -935,6 +976,7 @@ class NoemaRadioCardEditor extends HTMLElement {
       {
         type: 'grid', name: '', schema: [
           { name: 'all_players', selector: { boolean: {} } },
+          { name: 'multiroom', selector: { boolean: {} } },
           { name: 'glass', selector: { boolean: {} } },
           { name: 'cover_lookup', selector: { boolean: {} } },
           { name: 'player_art', selector: { boolean: {} } },
@@ -979,6 +1021,7 @@ class NoemaRadioCardEditor extends HTMLElement {
       entities: ents,
       columns: c.columns || 2,
       all_players: c.all_players !== false,
+      multiroom: c.multiroom !== false,
       glass: c.glass !== false,
       buttons: Array.isArray(c.buttons) ? c.buttons : NRC_BUTTONS.filter((b) => !(b === 'volume' && c.show_volume === false)),
       cover_lookup: c.cover_lookup !== false,
